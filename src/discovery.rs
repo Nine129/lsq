@@ -3,6 +3,7 @@
 
 use crate::proto::*;
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -286,6 +287,66 @@ async fn spawn_register_endpoint(
     Ok((bound, handle))
 }
 
+// Probe the whole /24 at once: dead hosts merely pend on ARP until the
+// grace cut, while every live peer answers inside the first second — batching
+// them would push late addresses past the grace (a dead host costs ~3s).
+const SCAN_CONCURRENCY: usize = 254;
+/// Extra time after `wait` for the unicast subnet scan: real devices answer
+/// in well under a second, silently-filtered hosts get cut off here.
+const SCAN_GRACE: Duration = Duration::from_secs(2);
+
+/// Unicast fallback scan (spec §3.2): probe every host of the primary
+/// interface's /24 over HTTPS /register — the official app does the same "for
+/// networks that do not carry multicast". Findings merge into `peers`; the
+/// task may be aborted early by [`discover`] without losing what landed.
+async fn scan_subnet(me: SelfDevice, peers: PeerMap, http: reqwest::Client) {
+    let Some(ip) = local_ipv4_interfaces().into_iter().find(|ip| !ip.is_unspecified()) else {
+        return;
+    };
+    let base = u32::from(ip) & 0xFFFF_FF00;
+    eprintln!("[lsq] scanning {}/24 via HTTPS /register", Ipv4Addr::from(base));
+    let body = me.device_info();
+    let fp = me.fingerprint.clone();
+    let probes = (1u32..=254).map(|host| {
+        let addr = Ipv4Addr::from(base | host);
+        let http = http.clone();
+        let peers = peers.clone();
+        let body = body.clone();
+        let fp = fp.clone();
+        async move {
+            let url = format!("https://{addr}:{DEFAULT_PORT}{API_BASE}/register");
+            let Ok(resp) = http
+                .post(&url)
+                .json(&body)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+            else {
+                return; // unreachable/refused hosts are the normal case
+            };
+            if !resp.status().is_success() {
+                eprintln!("[lsq] scan: {addr} answered HTTP {}", resp.status());
+                return;
+            }
+            let Ok(info) = resp.json::<DeviceInfo>().await else {
+                eprintln!("[lsq] scan: {addr} sent an unparseable register response");
+                return;
+            };
+            if info.fingerprint_or_default() == fp {
+                return; // our own device answering from another slot
+            }
+            let mut ann = info.to_announce();
+            ann.protocol = Some(Protocol::Https); // we probed https, say so
+            eprintln!("[lsq] scan found {} at {addr}", info.alias);
+            record_peer_trusted(&peers, ann, addr.into()).await;
+        }
+    });
+    futures_util::stream::iter(probes)
+        .buffer_unordered(SCAN_CONCURRENCY)
+        .collect::<Vec<()>>()
+        .await;
+}
+
 /// Active discovery: announce, listen for replies for `wait`, return peers.
 pub async fn discover(
     me: &SelfDevice,
@@ -312,9 +373,12 @@ pub async fn discover(
         sock.clone(),
         me.clone(),
         peers.clone(),
-        http,
+        http.clone(),
         MULTICAST_PORT,
     ));
+    // Unicast subnet scan runs alongside the multicast cadence — this is what
+    // finds peers when UDP multicast never arrives (AP/client-side filtering).
+    let mut scan = tokio::spawn(scan_subnet(me.clone(), peers.clone(), http));
 
     // Official cadence: 3 datagrams after sleeps of 100/500/2000 ms
     // (multicast_discovery.dart) to compensate UDP loss.
@@ -325,8 +389,11 @@ pub async fn discover(
         send_announcement(&me, MULTICAST_PORT).await.ok();
     }
     tokio::time::sleep(wait.saturating_sub(elapsed)).await;
-    // Tear down both the listen loop and the temporary register server so
-    // neither the task nor its ephemeral port leaks past discovery.
+    // Linger briefly for the unicast scan, then tear down the listen loop,
+    // the scan, and the temporary register server so none of their tasks or
+    // ports leak past discovery.
+    let _ = tokio::time::timeout(SCAN_GRACE, &mut scan).await;
+    scan.abort();
     listener.abort();
     register_server.abort();
 
