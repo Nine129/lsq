@@ -34,6 +34,7 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 thiserror = "1"
 futures-util = "0.3"
+libc = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 mime_guess = "2"
 hostname = "0.4"

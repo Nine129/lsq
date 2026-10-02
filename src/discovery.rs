@@ -295,20 +295,66 @@ const SCAN_CONCURRENCY: usize = 254;
 /// in well under a second, silently-filtered hosts get cut off here.
 const SCAN_GRACE: Duration = Duration::from_secs(2);
 
-/// Unicast fallback scan (spec §3.2): probe every host of the primary
-/// interface's /24 over HTTPS /register — the official app does the same "for
-/// networks that do not carry multicast". Findings merge into `peers`; the
-/// task may be aborted early by [`discover`] without losing what landed.
+/// Local IPv4 /24s worth scanning: one per interface address with a /24–/31
+/// prefix (point-to-point /32 tunnels and big routed nets are skipped).
+/// Interface addresses come from getifaddrs, not from routing — a VPN policy
+/// table stealing the multicast route cannot misdirect the scan.
+fn local_scan_subnets() -> Vec<u32> {
+    struct Ifaddrs(*mut libc::ifaddrs);
+    impl Drop for Ifaddrs {
+        fn drop(&mut self) {
+            unsafe { libc::freeifaddrs(self.0) }
+        }
+    }
+    let mut out: Vec<u32> = Vec::new();
+    let mut list = Ifaddrs(std::ptr::null_mut());
+    if unsafe { libc::getifaddrs(&mut list.0) } != 0 {
+        return out;
+    }
+    let mut cur = list.0;
+    while !cur.is_null() {
+        let a = unsafe { &*cur };
+        if !a.ifa_addr.is_null()
+            && !a.ifa_netmask.is_null()
+            && unsafe { (*a.ifa_addr).sa_family } == libc::AF_INET as libc::sa_family_t
+        {
+            let addr =
+                u32::from_be(unsafe { *(a.ifa_addr as *const libc::sockaddr_in) }.sin_addr.s_addr);
+            let ones = u32::from_be(unsafe { *(a.ifa_netmask as *const libc::sockaddr_in) }
+                .sin_addr
+                .s_addr)
+                .count_ones();
+            if (24..=31).contains(&ones) {
+                let base = addr & 0xFFFF_FF00;
+                if !out.contains(&base) {
+                    out.push(base);
+                }
+            }
+        }
+        cur = a.ifa_next;
+    }
+    out
+}
+
+/// Unicast fallback scan (spec §3.2): probe every host of each local /24 over
+/// HTTPS /register — the official app does the same "for networks that do not
+/// carry multicast". Findings merge into `peers`; the task may be aborted
+/// early by [`discover`] without losing what landed.
 async fn scan_subnet(me: SelfDevice, peers: PeerMap, http: reqwest::Client) {
-    let Some(ip) = local_ipv4_interfaces().into_iter().find(|ip| !ip.is_unspecified()) else {
+    let subnets = local_scan_subnets();
+    if subnets.is_empty() {
         return;
-    };
-    let base = u32::from(ip) & 0xFFFF_FF00;
-    eprintln!("[lsq] scanning {}/24 via HTTPS /register", Ipv4Addr::from(base));
+    }
     let body = me.device_info();
     let fp = me.fingerprint.clone();
-    let probes = (1u32..=254).map(|host| {
-        let addr = Ipv4Addr::from(base | host);
+    let probes = subnets
+        .into_iter()
+        .flat_map(|base| {
+            eprintln!("[lsq] scanning {}/24 via HTTPS /register", Ipv4Addr::from(base));
+            (1u32..=254).map(move |host| (base, host))
+        })
+        .map(|(base, host)| {
+            let addr = Ipv4Addr::from(base | host);
         let http = http.clone();
         let peers = peers.clone();
         let body = body.clone();
